@@ -709,6 +709,8 @@ func (dm *DockerManager) runContainer(
 	if runtime.GOOS == "windows" {
 		hc.DNS = opts.DNS
 		hc.DNSSearch = opts.DNSSearch
+		// Windows doesn't support MemorySwap parameter
+		hc.Resources.MemorySwap = 0
 	}
 
 	// Set sysctls if requested
