@@ -23,16 +23,16 @@ import (
 	"time"
 
 	"github.com/golang/glog"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/wait"
+	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	federation_v1beta1 "k8s.io/kubernetes/federation/apis/federation/v1beta1"
 	fedclientset "k8s.io/kubernetes/federation/client/clientset_generated/federation_clientset"
 	"k8s.io/kubernetes/pkg/api"
-	metav1 "k8s.io/kubernetes/pkg/apis/meta/v1"
 	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	"k8s.io/kubernetes/pkg/client/restclient"
-	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
-	clientcmdapi "k8s.io/kubernetes/pkg/client/unversioned/clientcmd/api"
-	utilnet "k8s.io/kubernetes/pkg/util/net"
-	"k8s.io/kubernetes/pkg/util/wait"
 )
 
 const (
@@ -92,7 +92,7 @@ var KubeconfigGetterForCluster = func(c *federation_v1beta1.Cluster) clientcmd.K
 	}
 }
 
-// KubeconfigGettterForSecret is used to get the kubeconfig from the given secret.
+// KubeconfigGetterForSecret is used to get the kubeconfig from the given secret.
 var KubeconfigGetterForSecret = func(secretName string) clientcmd.KubeconfigGetter {
 	return func() (*clientcmdapi.Config, error) {
 		var data []byte
@@ -137,7 +137,7 @@ var KubeconfigGetterForSecret = func(secretName string) clientcmd.KubeconfigGett
 	}
 }
 
-// Retruns Clientset for the given cluster.
+// Returns Clientset for the given cluster.
 func GetClientsetForCluster(cluster *federation_v1beta1.Cluster) (*fedclientset.Clientset, error) {
 	clusterConfig, err := BuildClusterConfig(cluster)
 	if err != nil && clusterConfig != nil {
