@@ -72,12 +72,10 @@ var (
 
 func UpdateEndpoidNamespaceMap(allEndpoints []api.Endpoints) {
 	enm := make(EndpointNamespaceMap)
-	for i := range allEndpoints {
-		svcEndpoints := &allEndpoints[i]
+	for _, svcEndpoints := range allEndpoints {
 		for _, ss := range svcEndpoints.Subsets {
 			for _, addr := range ss.Addresses {
 				enm[addr.IP] = svcEndpoints.Namespace
-				glog.V(4).Infof("Namespace %s has endpoint %s", svcEndpoints.Namespace, addr.IP)
 			}
 		}
 	}
@@ -652,7 +650,6 @@ func (udp *udpProxySocket) ProxyLoop(service ServicePortPortalName, myInfo *serv
 			for _, suffix := range suffixList {
 				dnsSearch = append(dnsSearch, suffix)
 				if strings.HasPrefix(suffix, "svc.") {
-					glog.V(4).Infof("Found cluster service domain %s", suffix)
 					clusterSvcDomain = suffix
 				}
 			}
@@ -679,8 +676,10 @@ func (udp *udpProxySocket) ProxyLoop(service ServicePortPortalName, myInfo *serv
 			break
 		}
 
+		var svrConn net.Conn
 		// If this is DNS query packet
 		if isDnsService(service.Port) {
+			var dnsSearchInNS []string
 			if len(clusterSvcDomain) > 0 {
 				udpAddr, ok := cliAddr.(*net.UDPAddr)
 				if ok {
@@ -688,24 +687,28 @@ func (udp *udpProxySocket) ProxyLoop(service ServicePortPortalName, myInfo *serv
 					enMapGuard.Lock()
 					ns := endpointNamespaceMap[ip]
 					enMapGuard.Unlock()
-					glog.V(4).Infof("Namespace of endpoint %s is %s", ip, ns)
 					if len(ns) > 0 {
-						dnsSearch = append(dnsSearch, ns + "." + clusterSvcDomain)
-						glog.V(4).Infof("Domain for endpoint %s is %s", ip, ns + "." + clusterSvcDomain)
+						dnsSearchInNS = append(dnsSearchInNS, ns + "." + clusterSvcDomain)
 					}
 				} else {
 					glog.Errorf("The endpoint %s is not a UDP endpoint.", cliAddr.String())
 				}
 			}
 
-			n = processDnsQueryPacket(myInfo.dnsClients, cliAddr, buffer[:], n, dnsSearch)
+			dnsSearchesWithNS := append(dnsSearch, dnsSearchInNS...)
+			n = processDnsQueryPacket(myInfo.dnsClients, cliAddr, buffer[:], n, dnsSearchesWithNS)
+			svrConn, err = udp.getBackendConn(myInfo.activeClients, myInfo.dnsClients, cliAddr, proxier, service, myInfo.timeout, dnsSearchesWithNS)
+			if err != nil {
+				continue
+			}
+		} else {
+			// If this is a client we know already, reuse the connection and goroutine.
+			svrConn, err = udp.getBackendConn(myInfo.activeClients, myInfo.dnsClients, cliAddr, proxier, service, myInfo.timeout, dnsSearch)
+			if err != nil {
+				continue
+			}
 		}
 
-		// If this is a client we know already, reuse the connection and goroutine.
-		svrConn, err := udp.getBackendConn(myInfo.activeClients, myInfo.dnsClients, cliAddr, proxier, service, myInfo.timeout, dnsSearch)
-		if err != nil {
-			continue
-		}
 		// TODO: It would be nice to let the goroutine handle this write, but we don't
 		// really want to copy the buffer.  We could do a pool of buffers or something.
 		_, err = svrConn.Write(buffer[0:n])
