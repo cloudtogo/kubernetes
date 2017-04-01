@@ -64,6 +64,29 @@ const (
 	dnsClassInternet uint16 = 0x01
 )
 
+type EndpointNamespaceMap map[string]string
+var (
+	endpointNamespaceMap EndpointNamespaceMap = make(EndpointNamespaceMap)
+	enMapGuard sync.Mutex
+)
+
+func UpdateEndpoidNamespaceMap(allEndpoints []api.Endpoints) {
+	enm := make(EndpointNamespaceMap)
+	for i := range allEndpoints {
+		svcEndpoints := &allEndpoints[i]
+		for _, ss := range svcEndpoints.Subsets {
+			for _, addr := range ss.Addresses {
+				enm[addr.IP] = svcEndpoints.Namespace
+				glog.V(4).Infof("Namespace %s has endpoint %s", svcEndpoints.Namespace, addr.IP)
+			}
+		}
+	}
+
+	enMapGuard.Lock()
+	defer enMapGuard.Unlock()
+	endpointNamespaceMap = enm
+}
+
 // Abstraction over TCP/UDP sockets which are proxied.
 type proxySocket interface {
 	// Addr gets the net.Addr for a proxySocket.
@@ -146,6 +169,7 @@ func tryConnect(service ServicePortPortalName, srcAddr net.Addr, protocol string
 			sessionAffinityReset = true
 			continue
 		}
+
 		return outConn, nil
 	}
 	return nil, fmt.Errorf("failed to connect to an endpoint.")
@@ -618,6 +642,7 @@ func processDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCache, cliA
 func (udp *udpProxySocket) ProxyLoop(service ServicePortPortalName, myInfo *serviceInfo, proxier *Proxier) {
 	var buffer [4096]byte // 4KiB should be enough for most whole-packets
 	var dnsSearch []string
+	var clusterSvcDomain string
 	if isDnsService(service.Port) {
 		dnsSearch = []string{"", namespaceServiceDomain, serviceDomain, clusterDomain}
 		execer := exec.New()
@@ -626,6 +651,10 @@ func (udp *udpProxySocket) ProxyLoop(service ServicePortPortalName, myInfo *serv
 		if err == nil {
 			for _, suffix := range suffixList {
 				dnsSearch = append(dnsSearch, suffix)
+				if strings.HasPrefix(suffix, "svc.") {
+					glog.V(4).Infof("Found cluster service domain %s", suffix)
+					clusterSvcDomain = suffix
+				}
 			}
 		}
 	}
@@ -652,6 +681,23 @@ func (udp *udpProxySocket) ProxyLoop(service ServicePortPortalName, myInfo *serv
 
 		// If this is DNS query packet
 		if isDnsService(service.Port) {
+			if len(clusterSvcDomain) > 0 {
+				udpAddr, ok := cliAddr.(*net.UDPAddr)
+				if ok {
+					ip := udpAddr.IP.String()
+					enMapGuard.Lock()
+					ns := endpointNamespaceMap[ip]
+					enMapGuard.Unlock()
+					glog.V(4).Infof("Namespace of endpoint %s is %s", ip, ns)
+					if len(ns) > 0 {
+						dnsSearch = append(dnsSearch, ns + "." + clusterSvcDomain)
+						glog.V(4).Infof("Domain for endpoint %s is %s", ip, ns + "." + clusterSvcDomain)
+					}
+				} else {
+					glog.Errorf("The endpoint %s is not a UDP endpoint.", cliAddr.String())
+				}
+			}
+
 			n = processDnsQueryPacket(myInfo.dnsClients, cliAddr, buffer[:], n, dnsSearch)
 		}
 
