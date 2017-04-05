@@ -282,10 +282,30 @@ type dnsQuestion struct {
 	qClass uint16
 }
 
+type dnsAnswerDomainName struct {
+	isPointer bool
+	domainName string
+}
+
+type dnsRRSpecificData struct {
+	rdLen uint16
+	rData []byte
+}
+
+// DNS packet answer section
+type dnsAnswer struct {
+	name  dnsAnswerDomainName
+	aType uint16
+	class uint16
+	ttl   uint32
+	rr    dnsRRSpecificData
+}
+
 // DNS message, only interested in question now
 type dnsMsg struct {
 	header   dnsHeader
 	question []dnsQuestion
+	answer []dnsAnswer
 }
 
 type dnsStruct interface {
@@ -305,6 +325,14 @@ func (question *dnsQuestion) walk(f func(field interface{}) bool) bool {
 	return f(&question.qName) &&
 		f(&question.qType) &&
 		f(&question.qClass)
+}
+
+func (answer *dnsAnswer) walk(f func(field interface{}) bool) bool {
+	return f(&answer.name) &&
+		f(&answer.aType) &&
+		f(&answer.class) &&
+		f(&answer.ttl) &&
+		f(&answer.rr)
 }
 
 func packDomainName(name string, buffer []byte, index int) (newIndex int, ok bool) {
@@ -336,6 +364,29 @@ func packDomainName(name string, buffer []byte, index int) (newIndex int, ok boo
 	return index, true
 }
 
+func packAnswerDomainName(name *dnsAnswerDomainName, buffer []byte, index int) (newIndex int, ok bool) {
+	if name.isPointer {
+		if len(name.domainName) != 2 {
+			glog.Errorf("Invalid pointer domain in dns anwser")
+			return
+		}
+
+		copy(buffer[index: index + 2], name.domainName)
+		index += 2
+		return index, true
+	}
+
+	return packDomainName(name.domainName, buffer, index)
+}
+
+func packRRSpecificData(rr *dnsRRSpecificData, buffer []byte, index int) (newIndex int, ok bool) {
+	binary.BigEndian.PutUint16(buffer[index:index + 2], rr.rdLen)
+	index += 2
+	copy(buffer[index: index + int(rr.rdLen)], rr.rData)
+	index += int(rr.rdLen)
+	return index, true
+}
+
 func unpackDomainName(buffer []byte, index int) (name string, newIndex int, ok bool) {
 	name = ""
 
@@ -362,6 +413,50 @@ func unpackDomainName(buffer []byte, index int) (name string, newIndex int, ok b
 	return name, index, true
 }
 
+func unpackAnswerDomainName(buffer []byte, index int) (name dnsAnswerDomainName, newIndex int, ok bool) {
+	if index + 1 > len(buffer) {
+		return
+	}
+
+	name = dnsAnswerDomainName{}
+	nameType := uint8(buffer[index]) & 0xC0
+	switch nameType {
+	case 0xC0:
+		if index + 2 > len(buffer) {
+			return
+		}
+		name.isPointer = true
+		name.domainName = string(buffer[index: index + 2])
+		index += 2
+	case 0x00:
+		name.isPointer = false
+		name.domainName, newIndex, ok = unpackDomainName(buffer, index)
+		return
+	default:
+		glog.Errorf("Unknown DNS answer with 1st byte %X", buffer[index])
+		return name, len(buffer), false
+	}
+
+	return name, index, true
+}
+
+func unpackRRSpecificData(buffer []byte, index int) (rr dnsRRSpecificData, newIndex int, ok bool) {
+	if index + 2 > len(buffer) {
+		return
+	}
+
+	rr = dnsRRSpecificData{}
+	rr.rdLen = binary.BigEndian.Uint16(buffer[index : index+2])
+	index += 2
+	if index + int(rr.rdLen) > len(buffer) {
+		return
+	}
+
+	rr.rData = buffer[index: index + int(rr.rdLen)]
+	index += int(rr.rdLen)
+	return rr, index, true
+}
+
 func packStruct(any dnsStruct, buffer []byte, index int) (newIndex int, ok bool) {
 	ok = any.walk(func(field interface{}) bool {
 		switch value := field.(type) {
@@ -374,6 +469,19 @@ func packStruct(any dnsStruct, buffer []byte, index int) (newIndex int, ok bool)
 			return true
 		case *dnsDomainName:
 			index, ok = packDomainName((*value).name, buffer, index)
+			return ok
+		case *uint32:
+			if index+4 > len(buffer) {
+				return false
+			}
+			binary.BigEndian.PutUint32(buffer[index:index+4], *value)
+			index += 4
+			return true
+		case *dnsAnswerDomainName:
+			index, ok = packAnswerDomainName(value, buffer, index)
+			return ok
+		case *dnsRRSpecificData:
+			index, ok = packRRSpecificData(value, buffer, index)
 			return ok
 		default:
 			return false
@@ -399,6 +507,19 @@ func unpackStruct(any dnsStruct, buffer []byte, index int) (newIndex int, ok boo
 		case *dnsDomainName:
 			(*value).name, index, ok = unpackDomainName(buffer, index)
 			return ok
+		case *uint32:
+			if index+4 > len(buffer) {
+				return false
+			}
+			*value = binary.BigEndian.Uint32(buffer[index : index+4])
+			index += 4
+			return true
+		case *dnsAnswerDomainName:
+			*value, index, ok = unpackAnswerDomainName(buffer, index)
+			return ok
+		case *dnsRRSpecificData:
+			*value, index, ok = unpackRRSpecificData(buffer, index)
+			return ok
 		default:
 			return false
 		}
@@ -418,11 +539,22 @@ func (msg *dnsMsg) packDnsMsg(buffer []byte) (length int, ok bool) {
 		return len(buffer), false
 	}
 
-	for i := 0; i < len(msg.question); i++ {
-		if index, ok = packStruct(&msg.question[i], buffer, index); !ok {
-			return len(buffer), false
+	if msg.header.qdCount > 0 {
+		for i := 0; i < len(msg.question); i++ {
+			if index, ok = packStruct(&msg.question[i], buffer, index); !ok {
+				return len(buffer), false
+			}
 		}
 	}
+
+	if msg.header.anCount > 0 {
+		for i := 0; i < len(msg.answer); i++ {
+			if index, ok = packStruct(&msg.answer[i], buffer, index); !ok {
+				return len(buffer), false
+			}
+		}
+	}
+
 	return index, true
 }
 
@@ -434,13 +566,35 @@ func (msg *dnsMsg) unpackDnsMsg(buffer []byte) (ok bool) {
 		return false
 	}
 
-	msg.question = make([]dnsQuestion, msg.header.qdCount)
-	for i := 0; i < len(msg.question); i++ {
-		if index, ok = unpackStruct(&msg.question[i], buffer, index); !ok {
-			return false
+	if msg.header.qdCount > 0 {
+		msg.question = make([]dnsQuestion, msg.header.qdCount)
+		for i := 0; i < len(msg.question); i++ {
+			if index, ok = unpackStruct(&msg.question[i], buffer, index); !ok {
+				return false
+			}
 		}
 	}
+
+	if msg.header.anCount > 0 {
+		msg.answer = make([]dnsAnswer, msg.header.anCount)
+		for i := 0; i < len(msg.answer); i++ {
+			if index, ok = unpackStruct(&msg.answer[i], buffer, index); !ok {
+				return false
+			}
+		}
+	}
+
 	return true
+}
+
+func (msg dnsMsg) isQuery() (bool) {
+	// Query - Response bit that specifies whether this message is a query (0) or a response (1).
+	return (msg.header.bits & 0x8000) == 0
+}
+
+func (msg dnsMsg) isAnswer() (bool) {
+	// Query - Response bit that specifies whether this message is a query (0) or a response (1).
+	return (msg.header.bits & 0x8000) != 0
 }
 
 // DNS query client classified by address and QTYPE
@@ -523,23 +677,23 @@ func processUnpackedDnsQueryPacket(dnsClients *dnsClientCache, msg *dnsMsg, host
 	return length
 }
 
-func processUnpackedDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCache, rcode uint16, host string, dnsQType uint16, buffer []byte, length int, dnsSearch []string) bool {
-	var drop bool
+func processUnpackedDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCache, msg *dnsMsg, host string, buffer []byte, length int, dnsSearch []string) (lenOut int)  {
+	lenOut = length
 	if dnsSearch == nil || len(dnsSearch) == 0 {
 		glog.V(1).Infof("DNS search list is not initialized and is empty.")
-		return drop
+		return
 	}
 
 	dnsClients.mu.Lock()
-	state, found := dnsClients.clients[dnsClientQuery{host, dnsQType}]
+	state, found := dnsClients.clients[dnsClientQuery{host, msg.question[0].qType}]
 	dnsClients.mu.Unlock()
 
 	if found {
 		index := atomic.SwapInt32(&state.searchIndex, state.searchIndex+1)
+		rcode := msg.header.bits & 0xf
 		if rcode != 0 && index >= 0 && index < int32(len(dnsSearch)) {
 			// If the reponse has failure and iteration through the search list has not
 			// reached the end, retry on behalf of the client using the original query message
-			drop = true
 			length = appendDnsSuffix(state.msg, buffer, length, dnsSearch[index])
 
 			_, err := svrConn.Write(buffer[0:length])
@@ -548,14 +702,37 @@ func processUnpackedDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCac
 					glog.Errorf("Write failed: %v", err)
 				}
 			}
+
+			return 0
 		} else {
+			searchIndex := index - 1
+			if searchIndex >= 0 && searchIndex < int32(len(dnsSearch)) {
+				for i := range msg.question {
+					if state.searchIndex == 0 {
+						continue
+					}
+
+					domain := &msg.question[i].qName
+					if strings.HasSuffix(domain.name, dnsSearch[searchIndex]) {
+						msg.question[i].qName.name = strings.TrimRight(domain.name, dnsSearch[searchIndex])
+					}
+				}
+
+				bufLen, ok := msg.packDnsMsg(buffer)
+				if !ok {
+					glog.V(4).Infof("Fail to pack dns message")
+				} else {
+					lenOut = bufLen;
+				}
+			}
+
 			dnsClients.mu.Lock()
-			delete(dnsClients.clients, dnsClientQuery{host, dnsQType})
+			delete(dnsClients.clients, dnsClientQuery{host, msg.question[0].qType})
 			dnsClients.mu.Unlock()
 		}
 	}
 
-	return drop
+	return
 }
 
 func processDnsQueryPacket(dnsClients *dnsClientCache, cliAddr net.Addr, buffer []byte, length int, dnsSearch []string) int {
@@ -565,9 +742,7 @@ func processDnsQueryPacket(dnsClients *dnsClientCache, cliAddr net.Addr, buffer 
 		return length
 	}
 
-	// Query - Response bit that specifies whether this message is a query (0) or a response (1).
-	qr := msg.header.bits & 0x8000
-	if qr != 0 {
+	if !msg.isQuery() {
 		glog.Warning("DNS packet should be a query message.")
 		return length
 	}
@@ -600,25 +775,24 @@ func processDnsQueryPacket(dnsClients *dnsClientCache, cliAddr net.Addr, buffer 
 	return length
 }
 
-func processDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCache, cliAddr net.Addr, buffer []byte, length int, dnsSearch []string) bool {
-	var drop bool
+func processDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCache, cliAddr net.Addr, buffer []byte, length int, dnsSearch []string) (len int) {
+	len = length
+
 	msg := &dnsMsg{}
 	if !msg.unpackDnsMsg(buffer[:length]) {
 		glog.Warning("Unable to unpack DNS packet.")
-		return drop
+		return
 	}
 
-	// Query - Response bit that specifies whether this message is a query (0) or a response (1).
-	qr := msg.header.bits & 0x8000
-	if qr == 0 {
+	if !msg.isAnswer() {
 		glog.Warning("DNS packet should be a response message.")
-		return drop
+		return
 	}
 
 	// QDCOUNT
 	if msg.header.qdCount != 1 {
 		glog.V(1).Infof("Number of entries in the reponse section of the DNS packet is: %d", msg.header.qdCount)
-		return drop
+		return
 	}
 
 	dnsQType := msg.question[0].qType
@@ -630,11 +804,10 @@ func processDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCache, cliA
 			host = cliAddr.String()
 		}
 
-		rcode := msg.header.bits & 0xf
-		drop = processUnpackedDnsResponsePacket(svrConn, dnsClients, rcode, host, dnsQType, buffer, length, dnsSearch)
+		return processUnpackedDnsResponsePacket(svrConn, dnsClients, msg, host, buffer, length, dnsSearch)
 	}
 
-	return drop
+	return
 }
 
 func (udp *udpProxySocket) ProxyLoop(service ServicePortPortalName, myInfo *serviceInfo, proxier *Proxier) {
@@ -768,12 +941,11 @@ func (udp *udpProxySocket) proxyClient(cliAddr net.Addr, svrConn net.Conn, activ
 			break
 		}
 
-		drop := false
 		if isDnsService(service.Port) {
-			drop = processDnsResponsePacket(svrConn, dnsClients, cliAddr, buffer[:], n, dnsSearch)
+			n = processDnsResponsePacket(svrConn, dnsClients, cliAddr, buffer[:], n, dnsSearch)
 		}
 
-		if !drop {
+		if n > 0 {
 			err = svrConn.SetDeadline(time.Now().Add(timeout))
 			if err != nil {
 				glog.Errorf("SetDeadline failed: %v", err)
