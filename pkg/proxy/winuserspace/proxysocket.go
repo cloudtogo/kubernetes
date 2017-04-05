@@ -306,6 +306,8 @@ type dnsMsg struct {
 	header   dnsHeader
 	question []dnsQuestion
 	answer []dnsAnswer
+	authority []dnsAnswer
+	additional []dnsAnswer
 }
 
 type dnsStruct interface {
@@ -555,6 +557,22 @@ func (msg *dnsMsg) packDnsMsg(buffer []byte) (length int, ok bool) {
 		}
 	}
 
+	if msg.header.nsCount > 0 {
+		for i := 0; i < len(msg.authority); i++ {
+			if index, ok = packStruct(&msg.authority[i], buffer, index); !ok {
+				return len(buffer), false
+			}
+		}
+	}
+
+	if msg.header.arCount > 0 {
+		for i := 0; i < len(msg.additional); i++ {
+			if index, ok = packStruct(&msg.additional[i], buffer, index); !ok {
+				return len(buffer), false
+			}
+		}
+	}
+
 	return index, true
 }
 
@@ -579,6 +597,24 @@ func (msg *dnsMsg) unpackDnsMsg(buffer []byte) (ok bool) {
 		msg.answer = make([]dnsAnswer, msg.header.anCount)
 		for i := 0; i < len(msg.answer); i++ {
 			if index, ok = unpackStruct(&msg.answer[i], buffer, index); !ok {
+				return false
+			}
+		}
+	}
+
+	if msg.header.nsCount > 0 {
+		msg.authority = make([]dnsAnswer, msg.header.nsCount)
+		for i := 0; i < len(msg.authority); i++ {
+			if index, ok = unpackStruct(&msg.authority[i], buffer, index); !ok {
+				return false
+			}
+		}
+	}
+
+	if msg.header.arCount > 0 {
+		msg.additional = make([]dnsAnswer, msg.header.arCount)
+		for i := 0; i < len(msg.additional); i++ {
+			if index, ok = unpackStruct(&msg.additional[i], buffer, index); !ok {
 				return false
 			}
 		}
@@ -692,12 +728,14 @@ func processUnpackedDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCac
 		index := atomic.SwapInt32(&state.searchIndex, state.searchIndex+1)
 		rcode := msg.header.bits & 0xf
 		if rcode != 0 && index >= 0 && index < int32(len(dnsSearch)) {
-			// If the reponse has failure and iteration through the search list has not
+			// If the response has failure and iteration through the search list has not
 			// reached the end, retry on behalf of the client using the original query message
 			length = appendDnsSuffix(state.msg, buffer, length, dnsSearch[index])
 
+			glog.Warningf("Retry suffix %s:%d", dnsSearch[index], index)
 			_, err := svrConn.Write(buffer[0:length])
 			if err != nil {
+				glog.Errorf("Fail to write new dns query cuz- %s", err)
 				if !logTimeout(err) {
 					glog.Errorf("Write failed: %v", err)
 				}
@@ -708,10 +746,6 @@ func processUnpackedDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCac
 			searchIndex := index - 1
 			if searchIndex >= 0 && searchIndex < int32(len(dnsSearch)) {
 				for i := range msg.question {
-					if state.searchIndex == 0 {
-						continue
-					}
-
 					domain := &msg.question[i].qName
 					if strings.HasSuffix(domain.name, dnsSearch[searchIndex]) {
 						msg.question[i].qName.name = strings.TrimRight(domain.name, dnsSearch[searchIndex])
@@ -849,6 +883,8 @@ func (udp *udpProxySocket) ProxyLoop(service ServicePortPortalName, myInfo *serv
 			break
 		}
 
+		glog.Warningf("Read %d bytes from client: %x", n, buffer[0:n])
+
 		var svrConn net.Conn
 		// If this is DNS query packet
 		if isDnsService(service.Port) {
@@ -882,19 +918,22 @@ func (udp *udpProxySocket) ProxyLoop(service ServicePortPortalName, myInfo *serv
 			}
 		}
 
+		err = svrConn.SetDeadline(time.Now().Add(myInfo.timeout))
+		if err != nil {
+			glog.Errorf("SetDeadline failed: %v", err)
+			continue
+		}
+
+		glog.Warningf("Write request to svrConn")
 		// TODO: It would be nice to let the goroutine handle this write, but we don't
 		// really want to copy the buffer.  We could do a pool of buffers or something.
 		_, err = svrConn.Write(buffer[0:n])
 		if err != nil {
+			glog.Errorf("Fail to write dns query cuz- %s", err)
 			if !logTimeout(err) {
 				glog.Errorf("Write failed: %v", err)
 				// TODO: Maybe tear down the goroutine for this client/server pair?
 			}
-			continue
-		}
-		err = svrConn.SetDeadline(time.Now().Add(myInfo.timeout))
-		if err != nil {
-			glog.Errorf("SetDeadline failed: %v", err)
 			continue
 		}
 	}
@@ -951,8 +990,11 @@ func (udp *udpProxySocket) proxyClient(cliAddr net.Addr, svrConn net.Conn, activ
 				glog.Errorf("SetDeadline failed: %v", err)
 				break
 			}
+
+			glog.Warningf("Write %d bytes into udp", n)
 			n, err = udp.WriteTo(buffer[0:n], cliAddr)
 			if err != nil {
+				glog.Errorf("Fail to write dns answers back cuz- %s", err)
 				if !logTimeout(err) {
 					glog.Errorf("WriteTo failed: %v", err)
 				}
