@@ -747,9 +747,7 @@ func processUnpackedDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCac
 			if searchIndex >= 0 && searchIndex < int32(len(dnsSearch)) {
 				for i := range msg.question {
 					domain := &msg.question[i].qName
-					if strings.HasSuffix(domain.name, dnsSearch[searchIndex]) {
-						msg.question[i].qName.name = strings.TrimRight(domain.name, dnsSearch[searchIndex])
-					}
+					msg.question[i].qName.name = strings.TrimSuffix(domain.name, "." + dnsSearch[searchIndex])
 				}
 
 				bufLen, ok := msg.packDnsMsg(buffer)
