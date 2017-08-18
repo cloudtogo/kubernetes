@@ -75,6 +75,7 @@ func UpdateEndpoidNamespaceMap(allEndpoints []api.Endpoints) {
 	for _, svcEndpoints := range allEndpoints {
 		for _, ss := range svcEndpoints.Subsets {
 			for _, addr := range ss.Addresses {
+				glog.V(3).Infof("Update EndpointMap %s => %s", addr.IP, svcEndpoints.Namespace)
 				enm[addr.IP] = svcEndpoints.Namespace
 			}
 		}
@@ -710,13 +711,15 @@ func processUnpackedDnsQueryPacket(dnsClients *dnsClientCache, msg *dnsMsg, host
 	}
 
 	length = appendDnsSuffix(msg, buffer, length, dnsSearch[index])
+	glog.V(3).Infof("Search the raw record from %s", host)
+
 	return length
 }
 
-func processUnpackedDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCache, msg *dnsMsg, host string, buffer []byte, length int, dnsSearch []string) (lenOut int)  {
+func processUnpackedDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCache, msg *dnsMsg, host string, buffer []byte, length int, dnsSearch []string, timeout time.Duration) (lenOut int)  {
 	lenOut = length
 	if dnsSearch == nil || len(dnsSearch) == 0 {
-		glog.V(1).Infof("DNS search list is not initialized and is empty.")
+		glog.V(1).Infof("DNS search list is not initialized or empty.")
 		return
 	}
 
@@ -732,10 +735,16 @@ func processUnpackedDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCac
 			// reached the end, retry on behalf of the client using the original query message
 			length = appendDnsSuffix(state.msg, buffer, length, dnsSearch[index])
 
-			glog.Warningf("Retry suffix %s:%d", dnsSearch[index], index)
-			_, err := svrConn.Write(buffer[0:length])
+			glog.V(3).Infof("Retry suffix %s:%d for %s", dnsSearch[index], index, host)
+			err := svrConn.SetDeadline(time.Now().Add(timeout))
 			if err != nil {
-				glog.Errorf("Fail to write new dns query cuz- %s", err)
+				glog.Errorf("SetDeadline failed: %v", err)
+				// Let it expired on fail
+			}
+
+			_, err = svrConn.Write(buffer[0:length])
+			if err != nil {
+				glog.Errorf("Fail to write DNS request to %s cuz- %s", svrConn.RemoteAddr().String(), err)
 				if !logTimeout(err) {
 					glog.Errorf("Write failed: %v", err)
 				}
@@ -743,16 +752,18 @@ func processUnpackedDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCac
 
 			return 0
 		} else {
+			glog.V(3).Infof("Got DNS response for %s and which rcode is %d", host, rcode)
 			searchIndex := index - 1
 			if searchIndex >= 0 && searchIndex < int32(len(dnsSearch)) {
 				for i := range msg.question {
 					domain := &msg.question[i].qName
+					glog.V(3).Infof("Try to get rid of suffix %s from %s", dnsSearch[searchIndex], domain.name)
 					msg.question[i].qName.name = strings.TrimSuffix(domain.name, "." + dnsSearch[searchIndex])
 				}
 
 				bufLen, ok := msg.packDnsMsg(buffer)
 				if !ok {
-					glog.V(4).Infof("Fail to pack dns message")
+					glog.V(3).Infof("Fail to pack dns message")
 				} else {
 					lenOut = bufLen;
 				}
@@ -807,9 +818,8 @@ func processDnsQueryPacket(dnsClients *dnsClientCache, cliAddr net.Addr, buffer 
 	return length
 }
 
-func processDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCache, cliAddr net.Addr, buffer []byte, length int, dnsSearch []string) (len int) {
+func processDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCache, cliAddr net.Addr, buffer []byte, length int, dnsSearch []string, timeout time.Duration) (len int) {
 	len = length
-
 	msg := &dnsMsg{}
 	if !msg.unpackDnsMsg(buffer[:length]) {
 		glog.Warning("Unable to unpack DNS packet.")
@@ -836,7 +846,7 @@ func processDnsResponsePacket(svrConn net.Conn, dnsClients *dnsClientCache, cliA
 			host = cliAddr.String()
 		}
 
-		return processUnpackedDnsResponsePacket(svrConn, dnsClients, msg, host, buffer, length, dnsSearch)
+		len = processUnpackedDnsResponsePacket(svrConn, dnsClients, msg, host, buffer, length, dnsSearch, timeout)
 	}
 
 	return
@@ -847,7 +857,7 @@ func (udp *udpProxySocket) ProxyLoop(service ServicePortPortalName, myInfo *serv
 	var dnsSearch []string
 	var clusterSvcDomain string
 	if isDnsService(service.Port) {
-		dnsSearch = []string{"", namespaceServiceDomain, serviceDomain, clusterDomain}
+		dnsSearch = []string{namespaceServiceDomain, serviceDomain, clusterDomain}
 		execer := exec.New()
 		ipconfigInterface := ipconfig.New(execer)
 		suffixList, err := ipconfigInterface.GetDnsSuffixSearchList()
@@ -856,8 +866,11 @@ func (udp *udpProxySocket) ProxyLoop(service ServicePortPortalName, myInfo *serv
 				dnsSearch = append(dnsSearch, suffix)
 				if strings.HasPrefix(suffix, "svc.") {
 					clusterSvcDomain = suffix
+					glog.V(3).Infof("Found cluster service suffix %s", clusterSvcDomain)
 				}
 			}
+		} else {
+			glog.Error("Fail to query DNS search list due to %s", err)
 		}
 	}
 
@@ -881,12 +894,12 @@ func (udp *udpProxySocket) ProxyLoop(service ServicePortPortalName, myInfo *serv
 			break
 		}
 
-		glog.Warningf("Read %d bytes from client: %x", n, buffer[0:n])
+		glog.V(3).Infof("Read %d bytes from client: %x", n, buffer[0:n])
 
 		var svrConn net.Conn
 		// If this is DNS query packet
 		if isDnsService(service.Port) {
-			var dnsSearchInNS []string
+			var dnsSearchInNS string
 			if len(clusterSvcDomain) > 0 {
 				udpAddr, ok := cliAddr.(*net.UDPAddr)
 				if ok {
@@ -895,14 +908,22 @@ func (udp *udpProxySocket) ProxyLoop(service ServicePortPortalName, myInfo *serv
 					ns := endpointNamespaceMap[ip]
 					enMapGuard.Unlock()
 					if len(ns) > 0 {
-						dnsSearchInNS = append(dnsSearchInNS, ns + "." + clusterSvcDomain)
+						dnsSearchInNS = ns + "." + clusterSvcDomain
+					} else {
+						glog.V(3).Infof("Can not found namespace matchs IP %s.", ip)
 					}
 				} else {
 					glog.Errorf("The endpoint %s is not a UDP endpoint.", cliAddr.String())
 				}
 			}
 
-			dnsSearchesWithNS := append(dnsSearch, dnsSearchInNS...)
+			dnsSearchesWithNS := []string{""}
+			if len(dnsSearchInNS) > 0 {
+				dnsSearchesWithNS = append(dnsSearchesWithNS, dnsSearchInNS)
+			}
+
+			dnsSearchesWithNS = append(dnsSearchesWithNS, dnsSearch...)
+			glog.V(3).Infof("Found %d DNS search suffixes for %s, which are %#v.", len(dnsSearchesWithNS), cliAddr.String(), dnsSearchesWithNS)
 			n = processDnsQueryPacket(myInfo.dnsClients, cliAddr, buffer[:], n, dnsSearchesWithNS)
 			svrConn, err = udp.getBackendConn(myInfo.activeClients, myInfo.dnsClients, cliAddr, proxier, service, myInfo.timeout, dnsSearchesWithNS)
 			if err != nil {
@@ -910,7 +931,8 @@ func (udp *udpProxySocket) ProxyLoop(service ServicePortPortalName, myInfo *serv
 			}
 		} else {
 			// If this is a client we know already, reuse the connection and goroutine.
-			svrConn, err = udp.getBackendConn(myInfo.activeClients, myInfo.dnsClients, cliAddr, proxier, service, myInfo.timeout, dnsSearch)
+			dnsSearchSuffixes := append([]string{""}, dnsSearch...)
+			svrConn, err = udp.getBackendConn(myInfo.activeClients, myInfo.dnsClients, cliAddr, proxier, service, myInfo.timeout, dnsSearchSuffixes)
 			if err != nil {
 				continue
 			}
@@ -922,7 +944,7 @@ func (udp *udpProxySocket) ProxyLoop(service ServicePortPortalName, myInfo *serv
 			continue
 		}
 
-		glog.Warningf("Write request to svrConn")
+		glog.V(3).Infof("Write request to svrConn")
 		// TODO: It would be nice to let the goroutine handle this write, but we don't
 		// really want to copy the buffer.  We could do a pool of buffers or something.
 		_, err = svrConn.Write(buffer[0:n])
@@ -972,6 +994,7 @@ func (udp *udpProxySocket) proxyClient(cliAddr net.Addr, svrConn net.Conn, activ
 	for {
 		n, err := svrConn.Read(buffer[0:])
 		if err != nil {
+			glog.Errorf("Fail to read udp package from server %s cuz- %s", svrConn.RemoteAddr().String(), err)
 			if !logTimeout(err) {
 				glog.Errorf("Read failed: %v", err)
 			}
@@ -979,7 +1002,7 @@ func (udp *udpProxySocket) proxyClient(cliAddr net.Addr, svrConn net.Conn, activ
 		}
 
 		if isDnsService(service.Port) {
-			n = processDnsResponsePacket(svrConn, dnsClients, cliAddr, buffer[:], n, dnsSearch)
+			n = processDnsResponsePacket(svrConn, dnsClients, cliAddr, buffer[:], n, dnsSearch, timeout)
 		}
 
 		if n > 0 {
@@ -989,10 +1012,10 @@ func (udp *udpProxySocket) proxyClient(cliAddr net.Addr, svrConn net.Conn, activ
 				break
 			}
 
-			glog.Warningf("Write %d bytes into udp", n)
+			glog.V(3).Infof("Write %d bytes into udp", n)
 			n, err = udp.WriteTo(buffer[0:n], cliAddr)
 			if err != nil {
-				glog.Errorf("Fail to write dns answers back cuz- %s", err)
+				glog.Errorf("Fail to write udp package to Pod %s cuz- %s", cliAddr.String(), err)
 				if !logTimeout(err) {
 					glog.Errorf("WriteTo failed: %v", err)
 				}
