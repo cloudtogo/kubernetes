@@ -24,16 +24,16 @@ param (
     [Parameter(Mandatory=$true)][string]$Hostname,
     [Parameter(Mandatory=$true)][string]$APIServer,
     [string]$InfraContainerImage = "apprenda/pause",
-    [string]$ClusterDNS = "10.0.0.10",
-    [string]$KubeletExePath = ".\kubelet.exe",
-    [string]$KubeProxyExePath = ".\kube-proxy.exe"
+    [string]$ClusterDNS = "10.96.0.10",
+    [string]$KubeletExePath = "C:\kubernetes\bin\kubelet.exe",
+    [string]$KubeProxyExePath = "C:\kubernetes\bin\kube-proxy.exe"
 )
 
 $kubeletDirectory = (Get-Item $KubeletExePath).Directory.FullName
 $kubeproxyDirectory = (Get-Item $KubeProxyExePath).Directory.FullName
 
 # Assemble the Kubelet executable arguments
-$kubeletArgs = @("--hostname-override=$Hostname","--pod-infra-container-image=$InfraContainerImage","--resolv-conf=""""","--api-servers=$APIServer","--cluster-dns=$ClusterDNS")
+$kubeletArgs = @("--hostname-override=$Hostname","--pod-infra-container-image=$InfraContainerImage","--resolv-conf=""""","--api-servers=$APIServer","--cluster-dns=$ClusterDNS","--enable-cri=false")
 # Assemble the kube-proxy executable arguments
 $kubeproxyArgs = @("--hostname-override=$Hostname","--proxy-mode=userspace","--bind-address=$Hostname","--master=$APIServer")
 
