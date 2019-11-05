@@ -33,7 +33,7 @@ $kubeletDirectory = (Get-Item $KubeletExePath).Directory.FullName
 $kubeproxyDirectory = (Get-Item $KubeProxyExePath).Directory.FullName
 
 # Assemble the Kubelet executable arguments
-$kubeletArgs = @("--hostname-override=$Hostname","--pod-infra-container-image=$InfraContainerImage","--resolv-conf=""","--api-servers=$APIServer","--cluster-dns=$ClusterDNS","--enable-cri=false","--cluster-domain=cluster.local")
+$kubeletArgs = @("--hostname-override=$Hostname","--pod-infra-container-image=$InfraContainerImage","--resolv-conf=""""","--api-servers=$APIServer","--cluster-dns=$ClusterDNS","--enable-cri=false","--cluster-domain=cluster.local")
 # Assemble the kube-proxy executable arguments
 $kubeproxyArgs = @("--hostname-override=$Hostname","--proxy-mode=userspace","--bind-address=$Hostname","--master=$APIServer")
 
